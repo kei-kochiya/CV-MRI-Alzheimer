@@ -1,0 +1,9 @@
+tensorflow
+numpy
+opencv-python
+jupyter
+opencv-python
+PIL
+fpdf
+streamlit
+matplotlib

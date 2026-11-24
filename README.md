@@ -12,7 +12,6 @@ Deep learning pipeline and diagnostic web workbench for classifying axial brain 
 - `src/alzheimer_mri/evaluate.py`: Test-split evaluator generating Polars predictions (`artifacts/test_predictions.parquet`) and `artifacts/confusion_matrix.png`.
 - `src/alzheimer_mri/predict.py`: Single-image inference, Grad-CAM blending, and PDF report export.
 - `app.py` + `web/` + `tokens.css`: FastAPI web workbench with drag-and-drop upload, dataset sample presets, live Grad-CAM opacity slider, side-by-side comparison, and PDF export.
-- `scripts/benchmark_polars.py`: Reproducible Polars vs. Pandas benchmark on the 44,000-image manifest.
 - `tests/test_pipeline.py`: CPU unit and FastAPI smoke tests.
 
 ## Setup
@@ -25,11 +24,10 @@ uv pip install --python .venv/Scripts/python.exe --no-deps -e .
 
 ## Usage
 
-### 1. Run CPU Verification Tests & Polars Benchmark
+### 1. Run CPU Verification Tests
 
 ```bash
 .venv/Scripts/python.exe -m pytest -v
-.venv/Scripts/python.exe scripts/benchmark_polars.py
 ```
 
 ### 2. Train ResNet34 (When GPU Is Free)

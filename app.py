@@ -1,154 +1,228 @@
-import streamlit as st
-import tensorflow as tf
-import numpy as np
-import cv2
-from PIL import Image, ImageOps
-from fpdf import FPDF
-import tempfile
+"""FastAPI web workbench for PyTorch ResNet34 Alzheimer's MRI screening."""
+
+from __future__ import annotations
+
+import argparse
+import io
 import os
-import datetime
+import time
+from pathlib import Path
+from typing import Annotated
 
-st.set_page_config(page_title="Alzheimer Detection", layout="wide")
+import matplotlib
+import numpy as np
+import polars as pl
+import uvicorn
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse, Response
+from fastapi.staticfiles import StaticFiles
+from PIL import Image
 
-st.markdown("""
-<style>
-    .stApp {background-color: #000000; color: #FFFFFF;}
-    .stFileUploader {background-color: #111111; border: 1px solid #333; border-radius: 5px;}
-    h1, h2, h3 {color: #00FFCC !important;}
-    div[data-testid="stMetricValue"] {color: #00FFCC !important;}
-    p, label, li {color: #E0E0E0 !important;}
-    .stProgress > div > div > div > div {background-color: #00FFCC;}
-    button {border: 1px solid #00FFCC !important; color: #00FFCC !important;}
-</style>
-""", unsafe_allow_html=True)
+from alzheimer_mri.config import CLASS_LABELS, CLASS_NAMES, VALID_EXTENSIONS
+from alzheimer_mri.model import count_parameters
+from alzheimer_mri.predict import (
+    AlzheimerPredictor,
+    create_pdf_report,
+    image_to_data_url,
+)
 
-@st.cache_resource
-def load_model():
-    return tf.keras.models.load_model('model.keras')
+BASE_DIR = Path(__file__).resolve().parent
+WEB_DIR = BASE_DIR / "web"
+DATASET_DIR = BASE_DIR / "dataset"
+MANIFEST_PATH = BASE_DIR / "artifacts" / "manifest.parquet"
+CHECKPOINT_PATH = Path(os.environ.get("MRI_CHECKPOINT", BASE_DIR / "artifacts" / "resnet34_best.pt"))
+DEVICE_NAME = os.environ.get("MRI_DEVICE", "cpu")
 
-def process_image(image):
-    image = ImageOps.fit(image, (128, 128), Image.LANCZOS)
-    img_array = np.asarray(image).astype(np.float32)
-    img_array = np.expand_dims(img_array, axis=0)
-    return img_array
+app = FastAPI(title="neuro-mri · ResNet34 Alzheimer Screening", version="0.2.0")
+app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
 
-def make_gradcam_heatmap(img_array, model, last_conv_layer_name='top_activation', pred_index=None):
-    grad_model = tf.keras.models.Model(
-        model.inputs, [model.get_layer(last_conv_layer_name).output, model.output]
+_predictor: AlzheimerPredictor | None = None
+
+
+def get_predictor() -> AlzheimerPredictor:
+    global _predictor
+    if _predictor is None:
+        _predictor = AlzheimerPredictor(
+            checkpoint_path=CHECKPOINT_PATH,
+            device_name=DEVICE_NAME,
+            allow_untrained_fallback=True,
+        )
+    return _predictor
+
+
+def _heatmap_only_image(heatmap: np.ndarray, size: tuple[int, int]) -> Image.Image:
+    heatmap_uint8 = np.clip(heatmap * 255.0, 0, 255).astype(np.uint8)
+    resized = Image.fromarray(heatmap_uint8, mode="L").resize(size, resample=Image.Resampling.BILINEAR)
+    norm = np.asarray(resized, dtype=np.float32) / 255.0
+    colored = (matplotlib.colormaps["turbo"](norm)[..., :3] * 255.0).astype(np.uint8)
+    return Image.fromarray(colored, mode="RGB")
+
+
+def _dataset_counts_via_polars() -> dict[str, int]:
+    if MANIFEST_PATH.is_file():
+        df = pl.read_parquet(MANIFEST_PATH)
+        grouped = df.group_by("class_name").agg(pl.len().alias("count"))
+        return dict(zip(grouped["class_name"].to_list(), grouped["count"].to_list()))
+
+    counts: dict[str, int] = {}
+    if DATASET_DIR.is_dir():
+        for cls in CLASS_NAMES:
+            cls_dir = DATASET_DIR / cls
+            if cls_dir.is_dir():
+                counts[cls] = sum(
+                    1 for entry in os.scandir(cls_dir) if entry.is_file()
+                )
+    return counts
+
+
+def _pick_sample_file(class_name: str) -> Path:
+    if class_name not in CLASS_NAMES:
+        raise HTTPException(status_code=404, detail=f"Unknown class preset: {class_name}")
+    cls_dir = DATASET_DIR / class_name
+    if not cls_dir.is_dir():
+        raise HTTPException(status_code=404, detail=f"Sample directory not found for {class_name}")
+
+    for entry in sorted(os.scandir(cls_dir), key=lambda e: e.name):
+        if entry.is_file() and Path(entry.name).suffix.lower() in VALID_EXTENSIONS:
+            return Path(entry.path)
+    raise HTTPException(status_code=404, detail=f"No sample MRI images found in {class_name}")
+
+
+async def _load_input_image(file: UploadFile | None, sample_class: str | None) -> Image.Image:
+    if file is not None and file.filename:
+        raw_bytes = await file.read()
+        if not raw_bytes:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+        try:
+            with Image.open(io.BytesIO(raw_bytes)) as img:
+                return img.convert("RGB")
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="Uploaded file is not a valid image.") from exc
+
+    if sample_class:
+        sample_path = _pick_sample_file(sample_class)
+        with Image.open(sample_path) as img:
+            return img.convert("RGB")
+
+    raise HTTPException(status_code=400, detail="Provide either an uploaded MRI file or a sample preset.")
+
+
+@app.get("/")
+def serve_index() -> FileResponse:
+    return FileResponse(WEB_DIR / "index.html")
+
+
+@app.get("/tokens.css")
+def serve_tokens() -> FileResponse:
+    return FileResponse(BASE_DIR / "tokens.css", media_type="text/css")
+
+
+@app.get("/favicon.ico")
+def serve_favicon() -> FileResponse:
+    return FileResponse(WEB_DIR / "favicon.svg", media_type="image/svg+xml")
+
+
+@app.get("/api/status")
+def api_status() -> dict[str, object]:
+    predictor = get_predictor()
+    total_params, _ = count_parameters(predictor.model)
+    return {
+        "arch": "ResNet34",
+        "model_mode": predictor.model_mode,
+        "val_acc": predictor.val_acc,
+        "epoch": predictor.epoch,
+        "img_size": predictor.img_size,
+        "device": str(predictor.device),
+        "total_params": total_params,
+        "dataset_counts": _dataset_counts_via_polars(),
+    }
+
+
+@app.get("/api/samples")
+def api_samples() -> dict[str, object]:
+    items: list[dict[str, str]] = []
+    if DATASET_DIR.is_dir():
+        for cls in CLASS_NAMES:
+            try:
+                sample_path = _pick_sample_file(cls)
+                items.append(
+                    {
+                        "class_name": cls,
+                        "display_label": CLASS_LABELS.get(cls, cls),
+                        "filename": sample_path.name,
+                    }
+                )
+            except HTTPException:
+                continue
+    return {"items": items}
+
+
+@app.post("/api/predict")
+async def api_predict(
+    file: Annotated[UploadFile | None, File()] = None,
+    sample_class: Annotated[str | None, Form()] = None,
+    alpha: Annotated[float, Form()] = 0.45,
+) -> dict[str, object]:
+    clamped_alpha = float(min(max(alpha, 0.0), 1.0))
+    image = await _load_input_image(file, sample_class)
+    predictor = get_predictor()
+
+    t0 = time.perf_counter()
+    result = predictor.predict_image(image, alpha=clamped_alpha)
+    inference_ms = (time.perf_counter() - t0) * 1000.0
+
+    heat_only = _heatmap_only_image(result.raw_heatmap, image.size)
+    probs_payload = {
+        cls: {
+            "label": CLASS_LABELS.get(cls, cls),
+            "prob": prob,
+        }
+        for cls, prob in result.probabilities.items()
+    }
+
+    return {
+        "predicted_class": result.predicted_class,
+        "display_label": result.display_label,
+        "confidence": result.confidence,
+        "probabilities": probs_payload,
+        "model_mode": result.model_mode,
+        "inference_ms": inference_ms,
+        "image_width": image.width,
+        "image_height": image.height,
+        "original_data_url": image_to_data_url(image, fmt="PNG"),
+        "heatmap_only_data_url": image_to_data_url(heat_only, fmt="PNG"),
+        "overlay_data_url": image_to_data_url(result.heatmap_overlay, fmt="PNG"),
+    }
+
+
+@app.post("/api/report")
+async def api_report(
+    file: Annotated[UploadFile | None, File()] = None,
+    sample_class: Annotated[str | None, Form()] = None,
+    alpha: Annotated[float, Form()] = 0.45,
+) -> Response:
+    clamped_alpha = float(min(max(alpha, 0.0), 1.0))
+    image = await _load_input_image(file, sample_class)
+    predictor = get_predictor()
+    result = predictor.predict_image(image, alpha=clamped_alpha)
+    pdf_bytes = create_pdf_report(image, result.heatmap_overlay, result)
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": 'attachment; filename="alzheimer_mri_report.pdf"'},
     )
 
-    with tf.GradientTape() as tape:
-        last_conv_layer_output, preds = grad_model(img_array)
-        
-        if isinstance(preds, list):
-            preds = preds[0]
-        
-        if pred_index is None:
-            pred_index = tf.argmax(preds[0])
-            
-        class_channel = preds[:, pred_index]
 
-    grads = tape.gradient(class_channel, last_conv_layer_output)
-    
-    if isinstance(last_conv_layer_output, list):
-        last_conv_layer_output = last_conv_layer_output[0]
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run the Alzheimer MRI web workbench.")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--device", default=os.environ.get("MRI_DEVICE", "cpu"))
+    args = parser.parse_args()
 
-    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-    
-    last_conv_layer_output = last_conv_layer_output[0]
-    heatmap = last_conv_layer_output @ pooled_grads[..., tf.newaxis]
-    heatmap = tf.squeeze(heatmap)
+    os.environ["MRI_DEVICE"] = args.device
+    uvicorn.run(app, host=args.host, port=args.port)
 
-    heatmap = tf.maximum(heatmap, 0) / tf.math.reduce_max(heatmap)
-    return heatmap.numpy()
 
-def create_pdf(image, result, confidence):
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_font("Arial", 'B', 20)
-    pdf.cell(0, 10, "ALZHEIMER DIAGNOSIS REPORT", ln=True, align='C')
-    pdf.ln(10)
-    
-    pdf.set_font("Arial", size=12)
-    current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    pdf.cell(0, 10, f"Date: {current_time}", ln=True)
-    pdf.ln(5)
-    
-    pdf.set_font("Arial", 'B', 14)
-    pdf.cell(0, 10, f"Diagnosis Result: {result}", ln=True)
-    pdf.cell(0, 10, f"Confidence: {confidence:.2f}%", ln=True)
-    pdf.ln(10)
-    
-    tmp_file_path = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_file:
-            image.save(tmp_file.name)
-            tmp_file_path = tmp_file.name
-        
-        pdf.image(tmp_file_path, x=10, y=80, w=100)
-    finally:
-        if tmp_file_path and os.path.exists(tmp_file_path):
-            os.unlink(tmp_file_path)
-        
-    return pdf.output(dest="S").encode("latin-1")
-
-try:
-    model = load_model()
-except:
-    st.error("Model file not found. Please check my_alzheimer_model.keras")
-    st.stop()
-
-CLASS_NAMES = ['Mild Demented', 'Moderate Demented', 'Non Demented', 'Very Mild Demented']
-
-st.title("Alzheimer Prediction System")
-
-file = st.file_uploader("Upload MRI Image", type=["jpg", "png", "jpeg"])
-
-if file is not None:
-    original_image = Image.open(file).convert('RGB')
-    processed_img = process_image(original_image)
-    
-    predictions = model.predict(processed_img)
-    scores = tf.nn.softmax(predictions[0]).numpy()
-    
-    final_class = CLASS_NAMES[np.argmax(scores)]
-    confidence = np.max(scores) * 100
-
-    col1, col2, col3 = st.columns([1.2, 1, 1])
-
-    with col1:
-        st.subheader("Diagnostic Result")
-        color_code = "#00FF00" if final_class == "Non Demented" else "#FF3333"
-        st.markdown(f"<h2 style='color: {color_code} !important;'>{final_class}</h2>", unsafe_allow_html=True)
-        st.metric("Confidence", f"{confidence:.2f}%")
-        
-        st.write("---")
-        st.write("Probability Distribution:")
-        for i, name in enumerate(CLASS_NAMES):
-            val = int(scores[i] * 100)
-            st.write(f"{name}")
-            st.progress(val)
-            st.caption(f"{val}%")
-            
-        pdf_bytes = create_pdf(original_image, final_class, confidence)
-        st.download_button(label="Download Medical Report (PDF)", data=pdf_bytes, file_name="report.pdf", mime="application/pdf")
-
-    with col2:
-        st.subheader("Original Image")
-        st.image(original_image, use_container_width=True)
-
-    with col3:
-        st.subheader("Heatmap")
-        try:
-            heatmap = make_gradcam_heatmap(processed_img, model)
-            
-            heatmap_resized = cv2.resize(heatmap, (original_image.size[0], original_image.size[1]))
-            
-            heatmap_resized = np.uint8(255 * heatmap_resized)
-            heatmap_colored = cv2.applyColorMap(heatmap_resized, cv2.COLORMAP_JET)
-            heatmap_colored = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGB)
-            
-            superimposed = cv2.addWeighted(np.array(original_image), 0.6, heatmap_colored, 0.4, 0)
-            st.image(superimposed, caption="Red areas indicate disease features", use_container_width=True)
-        except Exception as e:
-            st.warning(f"Could not generate heatmap: {e}")
+if __name__ == "__main__":
+    main()

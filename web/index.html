@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Alzheimer MRI Screening — PyTorch ResNet34 Workbench</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap"
+    rel="stylesheet"
+  />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="nav-edge">
+    <a class="wordmark" href="/">
+      <span>neuro-mri</span>
+      <span class="wordmark__tag">ResNet34</span>
+    </a>
+    <div id="model-status-pill" class="status-pill" data-mode="loading" aria-live="polite">
+      <span class="status-dot" aria-hidden="true"></span>
+      <span id="model-status-text">Checking model…</span>
+    </div>
+  </header>
+
+  <main class="shell">
+    <section class="intro" aria-labelledby="page-title">
+      <h1 id="page-title" class="intro__title">Axial brain MRI dementia staging</h1>
+      <p class="intro__lede">
+        Upload an axial T1-weighted MRI slice or pick a sample scan to inspect four-stage
+        PyTorch ResNet34 probabilities and spatial Grad-CAM attention.
+      </p>
+    </section>
+
+    <aside id="preview-notice" class="notice-banner" hidden>
+      <span>
+        Running in <strong>untrained preview mode</strong> because
+        <code>artifacts/resnet34_best.pt</code> has not been trained yet. Run
+        <code>python -m alzheimer_mri.train</code> once your GPU is free.
+      </span>
+    </aside>
+
+    <section class="workbench" aria-label="MRI diagnostic workbench">
+      <div class="panel">
+        <div class="panel__head">
+          <h2 class="panel__title">Scan input</h2>
+          <button id="clear-btn" type="button" class="btn" hidden>Reset</button>
+        </div>
+
+        <label id="dropzone" class="dropzone" for="mri-file-input" data-state="default">
+          <input
+            id="mri-file-input"
+            class="dropzone__input"
+            type="file"
+            accept=".jpg,.jpeg,.png,image/jpeg,image/png"
+          />
+          <span id="dropzone-title" class="dropzone__title">Select or drop an MRI image</span>
+          <span id="dropzone-hint" class="dropzone__hint">JPEG or PNG axial slice — resized to 224 × 224 px</span>
+        </label>
+
+        <div class="samples">
+          <span class="samples__label">Or test a dataset sample</span>
+          <div id="samples-grid" class="samples__grid" role="group" aria-label="Sample MRI scans">
+            <button type="button" class="btn btn--sample" disabled>Loading samples…</button>
+          </div>
+        </div>
+
+        <p id="feedback-line" class="feedback" role="status" aria-live="polite" data-state="idle"></p>
+
+        <div id="diagnosis-block" class="diagnosis" hidden>
+          <div class="diagnosis__header">
+            <div>
+              <span class="samples__label">Predicted stage</span>
+              <h3 id="diag-stage" class="diagnosis__stage">—</h3>
+            </div>
+            <span id="diag-confidence" class="diagnosis__confidence mono-num">—</span>
+          </div>
+
+          <div id="prob-list" class="probs" aria-label="Class probabilities"></div>
+
+          <div class="actions-row">
+            <button id="download-pdf-btn" type="button" class="btn btn--primary" disabled>
+              Export PDF
+            </button>
+            <button id="rerun-btn" type="button" class="btn" disabled>
+              Re-run scan
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div class="viewer-col">
+        <div class="viewer-controls">
+          <div class="seg-group" role="group" aria-label="Viewer layout">
+            <button
+              id="view-overlay-btn"
+              type="button"
+              class="seg-btn"
+              aria-pressed="true"
+              data-view="overlay"
+            >
+              Overlay
+            </button>
+            <button
+              id="view-split-btn"
+              type="button"
+              class="seg-btn"
+              aria-pressed="false"
+              data-view="side-by-side"
+            >
+              Side-by-side
+            </button>
+          </div>
+
+          <label class="slider-wrap" for="heatmap-opacity">
+            <span>Heatmap opacity</span>
+            <input
+              id="heatmap-opacity"
+              type="range"
+              min="0"
+              max="100"
+              value="45"
+              aria-label="Heatmap overlay opacity"
+            />
+            <span id="opacity-value" class="mono-num">45%</span>
+          </label>
+        </div>
+
+        <div id="scan-grid" class="scan-grid" data-view="overlay">
+          <figure class="scan-frame">
+            <div class="scan-stage">
+              <img id="img-primary-base" alt="Uploaded axial MRI scan" hidden />
+              <img id="img-primary-heat" class="scan-stage__heatmap" alt="" aria-hidden="true" hidden />
+              <p id="empty-primary" class="scan-empty">
+                No scan loaded yet. Drop a file on the left or choose one of the four stage presets.
+              </p>
+            </div>
+            <figcaption class="scan-caption">
+              <span id="caption-primary-left">Axial MRI + Grad-CAM</span>
+              <span id="caption-primary-right" class="mono-num">layer4[-1]</span>
+            </figcaption>
+          </figure>
+
+          <figure id="secondary-frame" class="scan-frame" hidden>
+            <div class="scan-stage">
+              <img id="img-secondary-heat" alt="ResNet34 Grad-CAM attention map" hidden />
+            </div>
+            <figcaption class="scan-caption">
+              <span>Grad-CAM attention map</span>
+              <span class="mono-num">normalized [0, 1]</span>
+            </figcaption>
+          </figure>
+        </div>
+
+        <div class="telemetry-strip" aria-label="Inference telemetry">
+          <div class="telemetry-cell">
+            <span class="telemetry-cell__label">Architecture</span>
+            <span id="tel-arch" class="telemetry-cell__val mono-num">ResNet34</span>
+          </div>
+          <div class="telemetry-cell">
+            <span class="telemetry-cell__label">Runtime device</span>
+            <span id="tel-device" class="telemetry-cell__val mono-num">—</span>
+          </div>
+          <div class="telemetry-cell">
+            <span class="telemetry-cell__label">Inference latency</span>
+            <span id="tel-latency" class="telemetry-cell__val mono-num">—</span>
+          </div>
+          <div class="telemetry-cell">
+            <span class="telemetry-cell__label">Checkpoint Val Acc</span>
+            <span id="tel-valacc" class="telemetry-cell__val mono-num">—</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="spec-section" aria-labelledby="spec-heading">
+      <div class="spec-section__head">
+        <h2 id="spec-heading" class="spec-section__title">Pipeline &amp; Polars manifest</h2>
+        <p class="spec-section__sub">
+          Stratified 70 / 15 / 15 splits indexed with Polars and stored in Parquet to prevent
+          batch-level data leakage.
+        </p>
+      </div>
+
+      <div class="spec-grid">
+        <dl class="spec-list">
+          <div class="spec-row">
+            <dt>Backbone</dt>
+            <dd id="spec-params" class="mono-num">torchvision.models.resnet34</dd>
+          </div>
+          <div class="spec-row">
+            <dt>Training schedule</dt>
+            <dd class="mono-num">5 warmup + 15 finetune · AdamW + AMP</dd>
+          </div>
+          <div class="spec-row">
+            <dt>Explainability layer</dt>
+            <dd class="mono-num">Grad-CAM · model.layer4[-1]</dd>
+          </div>
+          <div class="spec-row">
+            <dt>Manifest engine</dt>
+            <dd class="mono-num">Polars Parquet · 3.47× faster vs Pandas</dd>
+          </div>
+        </dl>
+
+        <dl id="dataset-spec-list" class="spec-list">
+          <div class="spec-row">
+            <dt>Mild Dementia</dt>
+            <dd class="mono-num" data-cls="MildDemented">—</dd>
+          </div>
+          <div class="spec-row">
+            <dt>Moderate Dementia</dt>
+            <dd class="mono-num" data-cls="ModerateDemented">—</dd>
+          </div>
+          <div class="spec-row">
+            <dt>Non-Demented</dt>
+            <dd class="mono-num" data-cls="NonDemented">—</dd>
+          </div>
+          <div class="spec-row">
+            <dt>Very Mild Dementia</dt>
+            <dd class="mono-num" data-cls="VeryMildDemented">—</dd>
+          </div>
+        </dl>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot-line">
+    <span>neuro-mri · PyTorch ResNet34 + Polars</span>
+    <span>Research &amp; educational use only — not a clinical diagnosis</span>
+  </footer>
+
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

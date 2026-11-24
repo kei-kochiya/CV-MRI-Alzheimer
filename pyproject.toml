@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alzheimer-mri"
+version = "0.2.0"
+description = "PyTorch ResNet34 Alzheimer's MRI classification with Polars data pipelines and Grad-CAM explainability."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.2.0",
+    "torchvision>=0.17.0",
+    "polars>=1.0.0",
+    "numpy>=1.26.0",
+    "pillow>=10.0.0",
+    "scikit-learn>=1.4.0",
+    "matplotlib>=3.8.0",
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.27.0",
+    "python-multipart>=0.0.9",
+    "fpdf2>=2.7.0",
+    "tqdm>=4.66.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pandas>=2.2.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
